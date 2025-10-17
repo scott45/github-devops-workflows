@@ -52,7 +52,7 @@ jobs:
           rm -f central-wf/sync-workflows.yml || true
           rm -f central-wf/node.js.yml || true
 
-            - name: Sync workflows to target repositories
+      - name: Sync workflows to target repositories
         env:
           REPOS: |
             github-devops-javascript
