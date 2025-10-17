@@ -9,8 +9,8 @@ REPOS=(
   github-devops-workflows
 )
 
-BRANCHES=("main" "dev" "multitenancy")
-ORG="tazama-lf"
+BRANCHES=("main" "dev")
+ORG="scott45"
 
 # Ensure gh is authenticated
 if ! gh auth status > /dev/null 2>&1; then

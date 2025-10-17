@@ -33,9 +33,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gh
 
+      # CHANGED: make signer robust for workflow_dispatch (no PR payload)
       - name: Set signer from PR author (event payload)
         run: |
-          echo "PR_AUTHOR_NAME_FULL=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "PR_AUTHOR_NAME_FULL=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
+          else
+            echo "PR_AUTHOR_NAME_FULL=${{ github.actor }}" >> $GITHUB_ENV
+          fi
           # Email generally isn't available via event payload; use a neutral noreply
           echo "PR_AUTHOR_EMAIL=actions@github.com" >> $GITHUB_ENV
 
@@ -54,6 +59,7 @@ jobs:
           rm -f central-wf/sync-workflows.yml || true
           rm -f central-wf/node.js.yml || true
 
+      # CHANGED: use a fixed branch per repo ("sync-workflows") and reuse/update same PR
       - name: Sync workflows to target repositories
         env:
           REPOS: |
@@ -62,14 +68,12 @@ jobs:
           SPECIFIC_REPOS: ${{ vars.SPECIFIC_REPOS }}
           SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}
           PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}
-          # Use your fine-grained PAT with repo write access to targets:
-          GH_PAT: ${{ secrets.DEMO_GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.DEMO_GITHUB_TOKEN }}   # PAT with repo write on targets
         run: |
           set -euo pipefail
 
           SIGNED_OFF_BY="Signed-off-by: ${{ env.PR_AUTHOR_NAME_FULL }} <${{ env.PR_AUTHOR_EMAIL }}>"
-          TS="$(date -u +%Y%m%d-%H%M%S)"
-          BRANCH="sync-workflows/${TS}"
+          BRANCH="sync-workflows"   # fixed branch name so the same PR is reused
 
           # Prepare reviewer args
           IFS=',' read -ra REVIEWERS_ARR <<< "${PR_REVIEWERS:-}"
@@ -96,21 +100,26 @@ jobs:
             # Ensure origin uses tokenized URL for pushes too
             git remote set-url origin "https://${{ github.actor }}:${GH_PAT}@github.com/scott45/${repo}.git"
 
-            # Choose base branch (prefer dev; else default branch)
+            # Determine base branch (prefer dev; else default)
             BASE_BRANCH="dev"
+            echo "${GH_PAT}" > /tmp/gh_token
+            unset GITHUB_TOKEN GH_TOKEN
+            gh auth login --with-token < /tmp/gh_token >/dev/null
             if ! git ls-remote --exit-code --heads origin "$BASE_BRANCH" >/dev/null 2>&1; then
-              # temp-auth gh with token file (your original method)
-              echo "${GH_PAT}" > /tmp/gh_token
-              unset GITHUB_TOKEN GH_TOKEN
-              gh auth login --with-token < /tmp/gh_token
               BASE_BRANCH="$(gh repo view "scott45/${repo}" --json defaultBranchRef --jq .defaultBranchRef.name)"
             fi
             echo "Base branch: ${BASE_BRANCH}"
 
             git fetch origin
-            git checkout -B "$BRANCH" "origin/${BASE_BRANCH}"
 
-            # Copy central workflows (already prepared in ../central-wf by earlier step)
+            # CHANGED: if fixed branch exists, continue from it; else base on latest base branch
+            if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+              git checkout -B "$BRANCH" "origin/${BRANCH}"
+            else
+              git checkout -B "$BRANCH" "origin/${BASE_BRANCH}"
+            fi
+
+            # Copy central workflows (prepared earlier in ../central-wf)
             mkdir -p .github/workflows
             if in_array "${repo}" "${SPEC_REPOS_ARR[@]}"; then
               for f in ../central-wf/*; do
@@ -136,26 +145,33 @@ jobs:
             git -c user.name="github-actions" -c user.email="actions@github.com" \
               commit -m "ci: sync workflows from central-workflows ${SIGNED_OFF_BY}"
 
-            # Push branch (tokenized origin)
+            # Push updates to the fixed branch
             git push -u origin "$BRANCH"
 
-            # --- GH auth via tmp file (your original approach) ---
-            echo "${GH_PAT}" > /tmp/gh_token
-            unset GITHUB_TOKEN GH_TOKEN
-            gh auth login --with-token < /tmp/gh_token
-
-            # Create PR (if exists, show URL)
-            if ! gh pr create \
-              --base "$BASE_BRANCH" \
+            # CHANGED: reuse PR if one is already open from this branch
+            OPEN_PR_URL="$(gh pr list \
+              --repo "scott45/${repo}" \
               --head "$BRANCH" \
-              --title "ci: sync workflows from central-workflows" \
-              --body "This PR syncs workflows from the central-workflows repository. ${SIGNED_OFF_BY}" \
-              "${REVIEWER_ARGS[@]}"; then
-              echo "PR may already exist; showing…"
-              gh pr view --head "$BRANCH" --json url --jq .url || true
+              --state open \
+              --json url --jq '.[0].url' || true)"
+
+            if [ -n "$OPEN_PR_URL" ]; then
+              echo "Updated existing PR: $OPEN_PR_URL"
+            else
+              # No open PR—create one
+              if ! gh pr create \
+                --repo "scott45/${repo}" \
+                --base "$BASE_BRANCH" \
+                --head "$BRANCH" \
+                --title "ci: sync workflows from central-workflows" \
+                --body "This PR syncs workflows from the central-workflows repository. ${SIGNED_OFF_BY}" \
+                "${REVIEWER_ARGS[@]}"; then
+                echo "PR may already exist in a non-open state; showing any PR for this head…"
+                gh pr view --repo "scott45/${repo}" --head "$BRANCH" --json url --jq .url || true
+              fi
             fi
 
-            # cleanup: repo + token file
+            # cleanup
             rm -f /tmp/gh_token
             cd ..
             rm -rf "${repo}"
