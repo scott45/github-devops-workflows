@@ -1,57 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-name: Sync Workflows
-
-on:
-  pull_request:
-    branches: [ dev ]           # Run this workflow when a PR targeting 'dev' is closed
-    types: [ closed ]
-  workflow_dispatch:
-
-permissions:
-  contents: write               # needed to push branches to target repos
-  pull-requests: write          # needed to open PRs on target repos
-
-jobs:
-  Sync_All_Repos_Common_Workflows:
-    if: >
-      github.event.pull_request.merged == true &&
-      github.actor != 'dependabot[bot]' &&
-      github.actor != 'dependabot-preview[bot]'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout central workflows repo
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Install GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh
-
-      - name: Set signer from PR author (event payload)
-        run: |
-          echo "PR_AUTHOR_NAME_FULL=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
-          # Email generally isn't available via event payload; use a neutral noreply
-          echo "PR_AUTHOR_EMAIL=actions@github.com" >> $GITHUB_ENV
-
-      - name: Prepare central workflow payload
-        run: |
-          set -euo pipefail
-          # Stage central workflows in a temp dir
-          if [ ! -d ".github/workflows" ]; then
-            echo "No .github/workflows in central repo; nothing to sync."
-            exit 0
-          fi
-          mkdir -p central-wf
-          cp -r .github/workflows/* central-wf/
-
-          # Avoid recursive self-sync or repo-specific files (adjust as needed)
-          rm -f central-wf/sync-workflows.yml || true
-          rm -f central-wf/node.js.yml || true
-
       - name: Sync workflows to target repositories
         env:
           REPOS: |
@@ -60,38 +6,47 @@ jobs:
           SPECIFIC_REPOS: ${{ vars.SPECIFIC_REPOS }}
           SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}
           PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}   # fine-grained PAT with repo write on targets
+          # Use your fine-grained PAT with repo write access to targets:
+          GH_PAT: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-
-          # Make gh and git use the token automatically
-          export GH_TOKEN="$GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
           SIGNED_OFF_BY="Signed-off-by: ${{ env.PR_AUTHOR_NAME_FULL }} <${{ env.PR_AUTHOR_EMAIL }}>"
           TS="$(date -u +%Y%m%d-%H%M%S)"
           BRANCH="sync-workflows/${TS}"
 
+          # Prepare reviewer args
+          IFS=',' read -ra REVIEWERS_ARR <<< "${PR_REVIEWERS:-}"
+          REVIEWER_ARGS=()
+          for r in "${REVIEWERS_ARR[@]}"; do
+            [ -n "$r" ] && REVIEWER_ARGS+=(--reviewer "$r")
+          done
+
+          # Helper: array contains
+          in_array() { local n="$1"; shift; for x in "$@"; do [ "$x" = "$n" ] && return 0; done; return 1; }
+
+          # Parse optional repo/file exclusions
           IFS=',' read -ra SPEC_REPOS_ARR <<< "${SPECIFIC_REPOS:-}"
           IFS=',' read -ra SPEC_FILES_ARR <<< "${SPECIFIC_FILES:-}"
-          IFS=',' read -ra REVIEWERS_ARR  <<< "${PR_REVIEWERS:-}"
-
-          in_array() { local n="$1"; shift; for x in "$@"; do [ "$x" = "$n" ] && return 0; done; return 1; }
 
           while read -r repo; do
             [ -z "$repo" ] && continue
             echo "=== Syncing to scott45/${repo} ==="
 
-            # Clone (token is injected by insteadOf above)
-            git clone "https://github.com/scott45/${repo}.git"
+            # Clone using PAT in the URL
+            git clone "https://${{ github.actor }}:${GH_PAT}@github.com/scott45/${repo}.git"
             cd "${repo}"
 
-            # Ensure origin has token (belt & suspenders)
-            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/scott45/${repo}.git"
+            # Ensure origin uses tokenized URL for pushes too
+            git remote set-url origin "https://${{ github.actor }}:${GH_PAT}@github.com/scott45/${repo}.git"
 
-            # Pick base branch
+            # Choose base branch (prefer dev; else default branch)
             BASE_BRANCH="dev"
             if ! git ls-remote --exit-code --heads origin "$BASE_BRANCH" >/dev/null 2>&1; then
+              # temp-auth gh with token file (your original method)
+              echo "${GH_PAT}" > /tmp/gh_token
+              unset GITHUB_TOKEN GH_TOKEN
+              gh auth login --with-token < /tmp/gh_token
               BASE_BRANCH="$(gh repo view "scott45/${repo}" --json defaultBranchRef --jq .defaultBranchRef.name)"
             fi
             echo "Base branch: ${BASE_BRANCH}"
@@ -99,8 +54,8 @@ jobs:
             git fetch origin
             git checkout -B "$BRANCH" "origin/${BASE_BRANCH}"
 
+            # Copy central workflows (already prepared in ../central-wf by earlier step)
             mkdir -p .github/workflows
-
             if in_array "${repo}" "${SPEC_REPOS_ARR[@]}"; then
               for f in ../central-wf/*; do
                 bn="$(basename "$f")"
@@ -125,16 +80,15 @@ jobs:
             git -c user.name="github-actions" -c user.email="actions@github.com" \
               commit -m "ci: sync workflows from central-workflows ${SIGNED_OFF_BY}"
 
-            # Push with tokenized origin
+            # Push branch (tokenized origin)
             git push -u origin "$BRANCH"
 
-            # Build reviewer args
-            REVIEWER_ARGS=()
-            for r in "${REVIEWERS_ARR[@]}"; do
-              [ -n "$r" ] && REVIEWER_ARGS+=(--reviewer "$r")
-            done
+            # --- GH auth via tmp file (your original approach) ---
+            echo "${GH_PAT}" > /tmp/gh_token
+            unset GITHUB_TOKEN GH_TOKEN
+            gh auth login --with-token < /tmp/gh_token
 
-            # Create PR (gh uses GH_TOKEN)
+            # Create PR (if exists, show URL)
             if ! gh pr create \
               --base "$BASE_BRANCH" \
               --head "$BRANCH" \
@@ -145,6 +99,8 @@ jobs:
               gh pr view --head "$BRANCH" --json url --jq .url || true
             fi
 
+            # cleanup: repo + token file
+            rm -f /tmp/gh_token
             cd ..
             rm -rf "${repo}"
           done <<< "${REPOS}"
