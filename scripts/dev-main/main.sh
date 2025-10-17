@@ -16,13 +16,13 @@ if [ ! -f "$REPOS_FILE" ]; then
   exit 1
 fi
 
-TITLE="feat: New Release"
+TITLE="feat!: New Major Release"
 ASSIGNEE="scott45"
 REVIEWERS=""
 BODY="# SPDX-License-Identifier: Apache-2.0
 
 ## What did we change?
-Create New Release
+- Change exposed docker port for the service Create New Major Release
 
 ## How was it tested?
 - [ ] Locally
