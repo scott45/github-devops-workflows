@@ -63,7 +63,7 @@ jobs:
           SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}
           PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}
           # Use your fine-grained PAT with repo write access to targets:
-          GH_PAT: ${{ secrets.GH_TOKEN }}
+          GH_PAT: ${{ secrets.DEMO_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
