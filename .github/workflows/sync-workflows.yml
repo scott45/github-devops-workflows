@@ -73,7 +73,7 @@ jobs:
           set -euo pipefail
 
           SIGNED_OFF_BY="Signed-off-by: ${{ env.PR_AUTHOR_NAME_FULL }} <${{ env.PR_AUTHOR_EMAIL }}>"
-          BRANCH="sync-workflows"   # fixed branch name so the same PR is reused
+          BRANCH="central-workflows"   # fixed branch name so the same PR is reused
 
           # Prepare reviewer args
           IFS=',' read -ra REVIEWERS_ARR <<< "${PR_REVIEWERS:-}"
