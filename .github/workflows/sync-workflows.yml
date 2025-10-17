@@ -1,4 +1,58 @@
-      - name: Sync workflows to target repositories
+# SPDX-License-Identifier: Apache-2.0
+name: Sync Workflows
+
+on:
+  pull_request:
+    branches: [ dev ]           # Run this workflow when a PR targeting 'dev' is closed
+    types: [ closed ]
+  workflow_dispatch:
+
+permissions:
+  contents: write               # needed to push branches to target repos
+  pull-requests: write          # needed to open PRs on target repos
+
+jobs:
+  Sync_All_Repos_Common_Workflows:
+    if: >
+      github.event.pull_request.merged == true &&
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'dependabot-preview[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout central workflows repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Set signer from PR author (event payload)
+        run: |
+          echo "PR_AUTHOR_NAME_FULL=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
+          # Email generally isn't available via event payload; use a neutral noreply
+          echo "PR_AUTHOR_EMAIL=actions@github.com" >> $GITHUB_ENV
+
+      - name: Prepare central workflow payload
+        run: |
+          set -euo pipefail
+          # Stage central workflows in a temp dir
+          if [ ! -d ".github/workflows" ]; then
+            echo "No .github/workflows in central repo; nothing to sync."
+            exit 0
+          fi
+          mkdir -p central-wf
+          cp -r .github/workflows/* central-wf/
+
+          # Avoid recursive self-sync or repo-specific files (adjust as needed)
+          rm -f central-wf/sync-workflows.yml || true
+          rm -f central-wf/node.js.yml || true
+
+            - name: Sync workflows to target repositories
         env:
           REPOS: |
             github-devops-javascript
