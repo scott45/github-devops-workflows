@@ -1,118 +1,159 @@
 # SPDX-License-Identifier: Apache-2.0
-
-# This GitHub Actions workflow syncs workflows from a central repository to other repositories when a pull request is merged.
-
-# Please do not attempt to edit this flow without the direct consent from the DevOps team. This file is managed centrally.
-
 name: Sync Workflows
 
 on:
-  push:
-    branches: 
-      - dev # The branches below must be a subset of the branches above
+  pull_request:
+    branches: [ dev ]           # Run this workflow when a PR targeting 'dev' is closed
+    types: [ closed ]
   workflow_dispatch:
+
+permissions:
+  contents: write               # needed to push branches to target repos
+  pull-requests: write          # needed to open PRs on target repos
 
 jobs:
   Sync_All_Repos_Common_Workflows:
-    if: github.actor != 'dependabot[bot]' && github.actor != 'dependabot-preview[bot]'
-    runs-on: ubuntu-latest  # Use the latest Ubuntu runner for the job
+    if: >
+      github.event.pull_request.merged == true &&
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'dependabot-preview[bot]'
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Central Workflows Repo  # Step to checkout the repository containing the central workflows
+      - name: Checkout central workflows repo
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
 
-      - name: Set up Git  # Step to configure Git with necessary details
-        run: |
-          git config --global user.name 'github-actions'
-          git config --global user.email 'github-actions@github.com'
-          git config --global credential.helper store
-
-      - name: Install GitHub CLI  # Step to install GitHub CLI for creating pull requests
+      - name: Install GitHub CLI
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl
-          curl -fsSL https://github.com/cli/cli/releases/download/v2.14.7/gh_2.14.7_linux_amd64.tar.gz -o ghcli.tar.gz 
-          tar -xzf ghcli.tar.gz
-          sudo cp gh_2.14.7_linux_amd64/bin/gh /usr/local/bin/
+          sudo apt-get install -y gh
 
-      - name: Get PR author details  # Step to get the details of the pull request author
-        id: pr_author
-        env:
-          GH_TOKEN: ${{ secrets.DEMO_GITHUB_TOKEN }}
+      - name: Set signer from PR author (event payload)
         run: |
-          PR_AUTHOR_NAME=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.user.login')
-          PR_AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae')
-          PR_AUTHOR_NAME_FULL=$(git log -1 --pretty=format:'%an')
-          echo "PR_AUTHOR_NAME=${PR_AUTHOR_NAME}" >> $GITHUB_ENV
-          echo "PR_AUTHOR_EMAIL=${PR_AUTHOR_EMAIL}" >> $GITHUB_ENV
-          echo "PR_AUTHOR_NAME_FULL=${PR_AUTHOR_NAME_FULL}" >> $GITHUB_ENV
+          echo "PR_AUTHOR_NAME_FULL=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
+          # Email generally isn't available via event payload; use a neutral noreply
+          echo "PR_AUTHOR_EMAIL=actions@github.com" >> $GITHUB_ENV
 
-      - name: Sync Workflows to Other Repos  # Step to sync workflows to other repositories
+      - name: Prepare central workflow payload
+        run: |
+          set -euo pipefail
+          # Stage central workflows in a temp dir
+          if [ ! -d ".github/workflows" ]; then
+            echo "No .github/workflows in central repo; nothing to sync."
+            exit 0
+          fi
+          mkdir -p central-wf
+          cp -r .github/workflows/* central-wf/
+
+          # Avoid recursive self-sync or repo-specific files (adjust as needed)
+          rm -f central-wf/sync-workflows.yml || true
+          rm -f central-wf/node.js.yml || true
+
+      - name: Sync workflows to target repositories
         env:
-          REPOS: |  # List of repositories to sync workflows to
+          # List your target repositories here (one per line, owner omitted below for simplicity).
+          # You can also move this list into a repo variable and reference it as: ${{ vars.REPOS }}
+          REPOS: |
             github-devops-javascript
             github-devops-python
-            # many more listed here or could be stored in a repos.txt and read from there
-          SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}  # List of specific files not to copy to certain repositories
-          SPECIFIC_REPOS: ${{ vars.SPECIFIC_REPOS }}  # List of specific repositories needing specific files not included
-          PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}  # List of reviewers
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          # Optional: list of repositories that should *exclude* some files
+          SPECIFIC_REPOS: ${{ vars.SPECIFIC_REPOS }}        # e.g. "github-devops-python,another-repo"
+          # Optional: file names to exclude for the repos above (comma-separated)
+          SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}        # e.g. "special.yml,skip-this.yml"
+          # Optional: reviewers to request on the PR (comma-separated GitHub usernames)
+          PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}            # e.g. "Justus-at-Tazama,Sandy-at-Tazama"
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}             # token with repo:scope for all target repos
         run: |
+          set -euo pipefail
+          export GH_TOKEN="$GITHUB_TOKEN"   # gh CLI uses GH_TOKEN or GITHUB_TOKEN automatically
+
           SIGNED_OFF_BY="Signed-off-by: ${{ env.PR_AUTHOR_NAME_FULL }} <${{ env.PR_AUTHOR_EMAIL }}>"
-          for repo in $REPOS; do
-            git clone https://github.com/scott45/$repo.git
-            cd $repo
-            git remote set-url origin https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/scott45/$repo.git
+          TS="$(date -u +%Y%m%d-%H%M%S)"
+          BRANCH="sync-workflows/${TS}"
 
-            if git ls-remote --heads origin sync-workflows | grep sync-workflows; then
-              # Branch exists, pull the latest changes
-              git checkout sync-workflows
-              git pull origin sync-workflows
-            else
-              # Branch does not exist, create it
-              git checkout -b sync-workflows
+          # Parse comma-separated vars into arrays
+          IFS=',' read -ra SPEC_REPOS_ARR <<< "${SPECIFIC_REPOS:-}"
+          IFS=',' read -ra SPEC_FILES_ARR <<< "${SPECIFIC_FILES:-}"
+          IFS=',' read -ra REVIEWERS_ARR  <<< "${PR_REVIEWERS:-}"
+
+          # Helper: check if value is in array
+          in_array() {
+            local needle="$1"; shift
+            for x in "$@"; do
+              if [ "$x" = "$needle" ]; then return 0; fi
+            done
+            return 1
+          }
+
+          while read -r repo; do
+            [ -z "$repo" ] && continue
+            echo "=== Syncing to scott45/${repo} ==="
+
+            # Clone target repo with token
+            git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/scott45/${repo}.git"
+            cd "${repo}"
+
+            # Determine base branch: prefer 'dev', else default branch
+            BASE_BRANCH="dev"
+            if ! git ls-remote --exit-code --heads origin "$BASE_BRANCH" >/dev/null 2>&1; then
+              BASE_BRANCH="$(gh repo view "scott45/${repo}" --json defaultBranchRef --jq .defaultBranchRef.name)"
             fi
+            echo "Base branch: ${BASE_BRANCH}"
 
-            cd ..
-            mkdir -p temp-workflows
-            cp -r .github/workflows/* temp-workflows/
-            rm temp-workflows/sync-workflows.yml  # Remove the sync-workflows.yml to avoid recursive syncing
-            rm temp-workflows/node.js.yml  # Remove the node.js.yml to avoid removing benchmarking tests specific for each repo
-            mkdir -p $repo/.github/workflows  # Create the workflows directory if it does not exist
-            
-            # Copy all files except the specific ones to certain repos
-            if [[ " ${SPECIFIC_REPOS} " =~ " ${repo} " ]]; then
-              for file in temp-workflows/*; do
-                if ! [[ " ${SPECIFIC_FILES} " =~ " $(basename $file) " ]]; then
-                  cp -r $file $repo/.github/workflows/
-                fi
+            git fetch origin
+            git checkout -B "$BRANCH" "origin/${BASE_BRANCH}"
+
+            mkdir -p .github/workflows
+
+            # If repo is in SPECIFIC_REPOS, exclude SPECIFIC_FILES; else copy all
+            if in_array "${repo}" "${SPEC_REPOS_ARR[@]}"; then
+              for f in ../central-wf/*; do
+                bn="$(basename "$f")"
+                skip=false
+                for s in "${SPEC_FILES_ARR[@]}"; do
+                  [ -z "$s" ] && continue
+                  if [ "$bn" = "$s" ]; then skip=true; break; fi
+                done
+                $skip || cp -f "$f" .github/workflows/
               done
             else
-              cp -r temp-workflows/* $repo/.github/workflows/
+              cp -f ../central-wf/* .github/workflows/
             fi
 
-            cd $repo
-            git add .
-            git commit -m "ci: sync workflows from central-workflows ${SIGNED_OFF_BY}" || echo "No changes to commit"
-            git push origin sync-workflows || git push origin sync-workflows --force
-            
-            # Clear the GITHUB_TOKEN environment variable and use a temporary file for gh authentication
-            echo "${{ secrets.GH_TOKEN }}" > /tmp/gh_token
-            unset GITHUB_TOKEN
-            gh auth login --with-token < /tmp/gh_token
-            
-            # Create the PR with reviewers
-            IFS=',' read -ra REVIEWERS <<< "${PR_REVIEWERS}"
-            REVIEWERS_ARGS=""
-            for reviewer in "${REVIEWERS[@]}"; do
-              REVIEWERS_ARGS+="--reviewer $reviewer "
+            git add .github/workflows
+
+            if git diff --cached --quiet; then
+              echo "No workflow changes for ${repo}; skipping PR."
+              cd ..
+              rm -rf "${repo}"
+              continue
+            fi
+
+            git -c user.name="github-actions" -c user.email="actions@github.com" \
+              commit -m "ci: sync workflows from central-workflows ${SIGNED_OFF_BY}"
+
+            git push -u origin "$BRANCH"
+
+            # Build reviewer args (optional)
+            REVIEWER_ARGS=()
+            for r in "${REVIEWERS_ARR[@]}"; do
+              [ -n "$r" ] && REVIEWER_ARGS+=(--reviewer "$r")
             done
 
-            gh pr create --title "ci: sync workflows from central-workflows" --body "This PR syncs workflows from the central-workflows repository. ${SIGNED_OFF_BY}" --base dev --head sync-workflows $REVIEWERS_ARGS || echo "PR already exists, updating existing PR"
-            
-            # Cleanup
-            rm /tmp/gh_token
-            
+            # Create PR; if it already exists, just show it
+            if ! gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH" \
+              --title "ci: sync workflows from central-workflows" \
+              --body "This PR syncs workflows from the central-workflows repository. ${SIGNED_OFF_BY}" \
+              "${REVIEWER_ARGS[@]}"; then
+              echo "PR may already exist; showing…"
+              gh pr view --head "$BRANCH" --json url --jq .url || true
+            fi
+
             cd ..
-          done
+            rm -rf "${repo}"
+          done <<< "${REPOS}"
