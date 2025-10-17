@@ -54,49 +54,42 @@ jobs:
 
       - name: Sync workflows to target repositories
         env:
-          # List your target repositories here (one per line, owner omitted below for simplicity).
-          # You can also move this list into a repo variable and reference it as: ${{ vars.REPOS }}
           REPOS: |
             github-devops-javascript
             github-devops-python
-          # Optional: list of repositories that should *exclude* some files
-          SPECIFIC_REPOS: ${{ vars.SPECIFIC_REPOS }}        # e.g. "github-devops-python,another-repo"
-          # Optional: file names to exclude for the repos above (comma-separated)
-          SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}        # e.g. "special.yml,skip-this.yml"
-          # Optional: reviewers to request on the PR (comma-separated GitHub usernames)
-          PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}            # e.g. "Justus-at-Tazama,Sandy-at-Tazama"
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}             # token with repo:scope for all target repos
+          SPECIFIC_REPOS: ${{ vars.SPECIFIC_REPOS }}
+          SPECIFIC_FILES: ${{ vars.SPECIFIC_FILES }}
+          PR_REVIEWERS: ${{ vars.PR_REVIEWERS }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}   # fine-grained PAT with repo write on targets
         run: |
           set -euo pipefail
-          export GH_TOKEN="$GITHUB_TOKEN"   # gh CLI uses GH_TOKEN or GITHUB_TOKEN automatically
+
+          # Make gh and git use the token automatically
+          export GH_TOKEN="$GITHUB_TOKEN"
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
           SIGNED_OFF_BY="Signed-off-by: ${{ env.PR_AUTHOR_NAME_FULL }} <${{ env.PR_AUTHOR_EMAIL }}>"
           TS="$(date -u +%Y%m%d-%H%M%S)"
           BRANCH="sync-workflows/${TS}"
 
-          # Parse comma-separated vars into arrays
           IFS=',' read -ra SPEC_REPOS_ARR <<< "${SPECIFIC_REPOS:-}"
           IFS=',' read -ra SPEC_FILES_ARR <<< "${SPECIFIC_FILES:-}"
           IFS=',' read -ra REVIEWERS_ARR  <<< "${PR_REVIEWERS:-}"
 
-          # Helper: check if value is in array
-          in_array() {
-            local needle="$1"; shift
-            for x in "$@"; do
-              if [ "$x" = "$needle" ]; then return 0; fi
-            done
-            return 1
-          }
+          in_array() { local n="$1"; shift; for x in "$@"; do [ "$x" = "$n" ] && return 0; done; return 1; }
 
           while read -r repo; do
             [ -z "$repo" ] && continue
             echo "=== Syncing to scott45/${repo} ==="
 
-            # Clone target repo with token
-            git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/scott45/${repo}.git"
+            # Clone (token is injected by insteadOf above)
+            git clone "https://github.com/scott45/${repo}.git"
             cd "${repo}"
 
-            # Determine base branch: prefer 'dev', else default branch
+            # Ensure origin has token (belt & suspenders)
+            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/scott45/${repo}.git"
+
+            # Pick base branch
             BASE_BRANCH="dev"
             if ! git ls-remote --exit-code --heads origin "$BASE_BRANCH" >/dev/null 2>&1; then
               BASE_BRANCH="$(gh repo view "scott45/${repo}" --json defaultBranchRef --jq .defaultBranchRef.name)"
@@ -108,14 +101,12 @@ jobs:
 
             mkdir -p .github/workflows
 
-            # If repo is in SPECIFIC_REPOS, exclude SPECIFIC_FILES; else copy all
             if in_array "${repo}" "${SPEC_REPOS_ARR[@]}"; then
               for f in ../central-wf/*; do
                 bn="$(basename "$f")"
                 skip=false
                 for s in "${SPEC_FILES_ARR[@]}"; do
-                  [ -z "$s" ] && continue
-                  if [ "$bn" = "$s" ]; then skip=true; break; fi
+                  [ -n "$s" ] && [ "$bn" = "$s" ] && { skip=true; break; }
                 done
                 $skip || cp -f "$f" .github/workflows/
               done
@@ -124,7 +115,6 @@ jobs:
             fi
 
             git add .github/workflows
-
             if git diff --cached --quiet; then
               echo "No workflow changes for ${repo}; skipping PR."
               cd ..
@@ -135,15 +125,16 @@ jobs:
             git -c user.name="github-actions" -c user.email="actions@github.com" \
               commit -m "ci: sync workflows from central-workflows ${SIGNED_OFF_BY}"
 
+            # Push with tokenized origin
             git push -u origin "$BRANCH"
 
-            # Build reviewer args (optional)
+            # Build reviewer args
             REVIEWER_ARGS=()
             for r in "${REVIEWERS_ARR[@]}"; do
               [ -n "$r" ] && REVIEWER_ARGS+=(--reviewer "$r")
             done
 
-            # Create PR; if it already exists, just show it
+            # Create PR (gh uses GH_TOKEN)
             if ! gh pr create \
               --base "$BASE_BRANCH" \
               --head "$BRANCH" \
