@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-
 # This GitHub Actions workflow checks that all commits in a pull request (PR) have been verified with GPG signatures.
 
 name: GPG Verify
